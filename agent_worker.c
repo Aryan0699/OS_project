@@ -1,5 +1,4 @@
-// Read-only agent tools. All requests run in this same process, so future
-// process taint can follow a session. No new system calls are needed here.
+// Persistent xv6 user program used by the host-side Python agent.
 #include "types.h"
 #include "stat.h"
 #include "user.h"
@@ -7,18 +6,17 @@
 #include "fcntl.h"
 
 #define MAX_LINE 120
-#define MAX_PATH 80
 #define MAX_OUTPUT 4096
 
 static void
-done(int id, char *status)
+finish(char *status)
 {
-  printf(1, "@XV6 %d DONE %s\n", id, status);
+  printf(1, "@XV6 DONE %s\n", status);
 }
 
-// Encode payloads so file text cannot masquerade as a protocol response.
+// Hex keeps file contents separate from protocol control lines.
 static void
-data(int id, char *buf, int n)
+send_data(char *buf, int n)
 {
   char hex[129];
   char *digits = "0123456789abcdef";
@@ -29,166 +27,123 @@ data(int id, char *buf, int n)
     hex[2*i+1] = digits[((uchar)buf[i]) & 15];
   }
   hex[2*n] = 0;
-  printf(1, "@XV6 %d DATA %s\n", id, hex);
+  printf(1, "@XV6 DATA %s\n", hex);
 }
 
 static int
-validpath(char *path)
+valid_path(char *path)
 {
-  int i, start, len;
-  char c;
-
-  len = strlen(path);
-  if(len < 1 || len > MAX_PATH || path[0] != '/')
+  int i, n = strlen(path);
+  if(n < 1 || n > 80 || path[0] != '/')
     return 0;
-  if(len == 1)
-    return 1;
-  start = 1;
-  for(i = 1; i <= len; i++){
-    c = path[i];
-    if(c == '/' || c == 0){
-      if(i == start || i-start > DIRSIZ ||
-         (i-start == 1 && path[start] == '.') ||
-         (i-start == 2 && path[start] == '.' && path[start+1] == '.'))
-        return 0;
-      start = i+1;
-    } else if(!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+  for(i = 0; i < n; i++)
+    if(!((path[i] >= 'a' && path[i] <= 'z') ||
+         (path[i] >= 'A' && path[i] <= 'Z') ||
+         (path[i] >= '0' && path[i] <= '9') ||
+         path[i] == '/' || path[i] == '_' || path[i] == '-' || path[i] == '.'))
       return 0;
-  }
   return 1;
 }
 
 static void
-readfile(int id, int fd)
+read_file(int fd)
 {
   char buf[64];
-  int n, i, total, want;
+  int n, total = 0;
 
-  total = 0;
   while(total < MAX_OUTPUT){
-    want = MAX_OUTPUT-total;
-    if(want > sizeof(buf))
-      want = sizeof(buf);
-    n = read(fd, buf, want);
+    n = read(fd, buf, sizeof(buf));
     if(n < 0){
-      done(id, "ERROR read_failed");
+      finish("ERROR read_failed");
       return;
     }
     if(n == 0){
-      done(id, "OK");
+      finish("OK");
       return;
     }
-    for(i = 0; i < n; i++){
-      if(((uchar)buf[i] < 32 && buf[i] != '\n' &&
-          buf[i] != '\r' && buf[i] != '\t') || (uchar)buf[i] == 127){
-        done(id, "ERROR not_text");
-        return;
-      }
-    }
-    data(id, buf, n);
+    if(total+n > MAX_OUTPUT)
+      n = MAX_OUTPUT-total;
+    send_data(buf, n);
     total += n;
   }
   n = read(fd, buf, 1);
-  done(id, n < 0 ? "ERROR read_failed" : n ? "TRUNCATED" : "OK");
+  finish(n > 0 ? "TRUNCATED" : n == 0 ? "OK" : "ERROR read_failed");
 }
 
 static void
-listfiles(int id, int fd)
+list_files(int fd)
 {
-  struct dirent de;
+  struct dirent entry;
   char name[DIRSIZ+2];
-  int n, len, total;
+  int n, total = 0;
 
-  total = 0;
-  while((n = read(fd, &de, sizeof(de))) == sizeof(de)){
-    if(de.inum == 0)
+  while((n = read(fd, &entry, sizeof(entry))) == sizeof(entry)){
+    if(entry.inum == 0)
       continue;
-    memmove(name, de.name, DIRSIZ);
+    memmove(name, entry.name, DIRSIZ);
     name[DIRSIZ] = 0;
     if(strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
       continue;
-    len = strlen(name);
-    name[len++] = '\n';
-    if(total+len > MAX_OUTPUT){
-      done(id, "TRUNCATED");
+    n = strlen(name);
+    name[n++] = '\n';
+    if(total+n > MAX_OUTPUT){
+      finish("TRUNCATED");
       return;
     }
-    data(id, name, len);
-    total += len;
+    send_data(name, n);
+    total += n;
   }
-  done(id, n == 0 ? "OK" : "ERROR read_failed");
+  finish(n == 0 ? "OK" : "ERROR read_failed");
 }
 
 static void
-request(char *line)
+handle_request(char *line)
 {
-  char *op, *path, *p;
-  int id, fd;
+  char *path;
   struct stat st;
+  int fd;
 
-  op = strchr(line, ' ');
-  if(op == 0 || op == line || op-line > 9){
-    done(0, "ERROR invalid_request");
-    return;
-  }
-  *op++ = 0;
-  for(p = line; *p; p++)
-    if(*p < '0' || *p > '9'){
-      done(0, "ERROR invalid_request");
-      return;
-    }
-  id = atoi(line);
-  path = strchr(op, ' ');
-  if(id < 1 || path == 0){
-    done(id, "ERROR invalid_request");
+  path = strchr(line, ' ');
+  if(path == 0){
+    finish("ERROR invalid_request");
     return;
   }
   *path++ = 0;
-  if(!validpath(path)){
-    done(id, "ERROR invalid_path");
+
+  if(!valid_path(path)){
+    finish("ERROR invalid_request");
     return;
   }
-  if(strcmp(op, "READ") != 0 && strcmp(op, "LIST") != 0){
-    done(id, "ERROR unknown_operation");
+  if(strcmp(line, "READ") != 0 && strcmp(line, "LIST") != 0){
+    finish("ERROR unknown_operation");
     return;
   }
   fd = open(path, O_RDONLY);
   if(fd < 0){
-    done(id, "ERROR open_failed");
+    finish("ERROR open_failed");
     return;
   }
   if(fstat(fd, &st) < 0)
-    done(id, "ERROR stat_failed");
-  else if(strcmp(op, "READ") == 0 && st.type == T_FILE)
-    readfile(id, fd);
-  else if(strcmp(op, "LIST") == 0 && st.type == T_DIR)
-    listfiles(id, fd);
+    finish("ERROR stat_failed");
+  else if(strcmp(line, "READ") == 0 && st.type == T_FILE)
+    read_file(fd);
+  else if(strcmp(line, "LIST") == 0 && st.type == T_DIR)
+    list_files(fd);
   else
-    done(id, "ERROR wrong_file_type");
+    finish("ERROR wrong_file_type");
   close(fd);
 }
 
 int
 main(void)
 {
-  char line[MAX_LINE], c;
-  int n, overflow;
+  char line[MAX_LINE];
 
-  printf(1, "@XV6 READY 1 %d\n", getpid());
-  n = overflow = 0;
-  while(read(0, &c, 1) == 1){
-    if(c == '\n'){
-      line[n] = 0;
-      if(overflow)
-        done(0, "ERROR request_too_long");
-      else
-        request(line);
-      n = overflow = 0;
-    } else if(n < sizeof(line)-1)
-      line[n++] = c;
-    else
-      overflow = 1;
+  printf(1, "@XV6 READY %d\n", getpid());
+  while(1){
+    gets(line, sizeof(line));
+    if(strlen(line) > 0 && line[strlen(line)-1] == '\n')
+      line[strlen(line)-1] = 0;
+    handle_request(line);
   }
-  exit();
 }
