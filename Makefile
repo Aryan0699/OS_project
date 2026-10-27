@@ -183,15 +183,20 @@ UPROGS=\
 	_zombie\
 	_mytest\
 	_hello_test\
+	_agent_worker\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)
+
+# Separate disk for the agent demo; leave the existing guest's fs.img alone.
+agent-fs.img: mkfs README report.txt $(UPROGS)
+	./mkfs agent-fs.img README report.txt $(UPROGS)
 
 -include *.d
 
 clean: 
 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
-	*.o *.d *.asm *.sym vectors.S bootblock entryother \
+	*.o *.d *.asm *.sym vectors.S bootblock entryother agent-fs.img \
 	initcode initcode.out kernel xv6.img fs.img kernelmemfs \
 	xv6memfs.img mkfs .gdbinit \
 	$(UPROGS)
@@ -252,7 +257,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
 EXTRA=\
 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
-	printf.c umalloc.c mytest.c\
+	printf.c umalloc.c mytest.c agent_worker.c report.txt\
 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
 	.gdbinit.tmpl gdbutil\
 
