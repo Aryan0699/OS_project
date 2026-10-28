@@ -95,8 +95,19 @@ class GeminiAgent:
                 response = self.client.models.generate_content(
                     model=self.model, contents=history, config=self.config,
                 )
-            except Exception:
-                raise AgentError("Gemini request failed. Check the key, model, quota and internet.") from None
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                reasons = {
+                    400: "check the model name and request",
+                    401: "check the API key",
+                    403: "the API key does not have access",
+                    404: "the configured model was not found",
+                    429: "API quota or rate limit reached",
+                    503: "Gemini is temporarily busy; try again later",
+                }
+                reason = reasons.get(code, "check the key, model, quota and internet")
+                label = f" {code}" if code else ""
+                raise AgentError(f"Gemini API error{label}: {reason}.") from None
 
             if not response.candidates or not response.candidates[0].content:
                 raise AgentError("Gemini returned no response.")
@@ -115,10 +126,10 @@ class GeminiAgent:
             for call in calls:
                 calls_used += 1
                 result = execute_tool(bridge, call.name, call.args)
-                tool_results.append(types.Part.from_function_response(
-                    name=call.name, response=result,
-                ))
-            history.append(types.Content(role="tool", parts=tool_results))
+                tool_results.append(types.Part(function_response=types.FunctionResponse(
+                    id=call.id, name=call.name, response=result,
+                )))
+            history.append(types.Content(role="user", parts=tool_results))
 
         raise AgentError("Gemini did not finish the request.")
 
